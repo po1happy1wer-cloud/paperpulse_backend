@@ -77,8 +77,7 @@ app.get('/api/search-papers', async (req, res) => {
       return res.status(400).json({ success: false, error: '검색어를 입력해 주세요.' });
     }
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(query)}&limit=${limit}&offset=${offset}&fields=${SEMANTIC_SCHOLAR_FIELDS}`;
+    const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(query)}&limit=${limit}&fields=${SEMANTIC_SCHOLAR_FIELDS}`;
 
     // SEMANTIC_SCHOLAR_API_KEY는 선택 사항입니다. 없어도 동작하지만(비인증 요청),
     // 있으면 더 넉넉한 속도 제한을 받습니다. https://www.semanticscholar.org/product/api 에서 무료 발급.
@@ -94,122 +93,6 @@ app.get('/api/search-papers', async (req, res) => {
   } catch (error) {
     console.error('논문 검색 프록시 에러:', error);
     return res.status(500).json({ success: false, error: '논문 검색 처리 중 서버 오류가 발생했습니다.' });
-  }
-});
-
-// HTML 엔티티(&amp; &quot; &#39; 등)를 사람이 읽는 문자로 되돌림 — og:title 등에 흔히 포함됨
-function decodeHtmlEntities(str) {
-  if (!str) return str;
-  return str
-    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'")
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
-    .trim();
-}
-// <meta property="og:title" content="..."> 형태(속성 순서가 반대인 경우도) 하나를 읽어온다
-function extractMetaContent(html, key) {
-  const patterns = [
-    new RegExp(`<meta[^>]+(?:property|name)=["']${key}["'][^>]*content=["']([^"']*)["']`, 'i'),
-    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]*(?:property|name)=["']${key}["']`, 'i'),
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m) return decodeHtmlEntities(m[1]);
-  }
-  return null;
-}
-// citation_author처럼 같은 메타태그가 여러 개 반복될 수 있는 경우, 전부 모아서 쉼표로 합친다
-function extractMetaContentAll(html, key) {
-  const re = new RegExp(`<meta[^>]+(?:property|name)=["']${key}["'][^>]*content=["']([^"']*)["']`, 'gi');
-  const out = [];
-  let m;
-  while ((m = re.exec(html))) out.push(decodeHtmlEntities(m[1]));
-  return out;
-}
-// 사설(private)/루프백 주소로 보이는 호스트명을 간단히 걸러내는 최소한의 SSRF 방어 (완벽하지 않음, 1차 방어선)
-function looksLikePrivateHost(hostname) {
-  const h = (hostname || '').toLowerCase();
-  if (h === 'localhost' || h === '0.0.0.0' || h === '::1') return true;
-  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)) return true;
-  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return true;
-  return false;
-}
-
-/**
- * [GET] /api/fetch-url-metadata?url=...
- * "URL로 논문/아티클 등록" 기능용 — 브라우저는 CORS 때문에 다른 사이트의 HTML을 직접 읽을 수 없으므로,
- * 서버가 대신 그 페이지를 가져와 Open Graph(og:title 등)와 학술 메타태그(citation_title 등)만 뽑아 돌려준다.
- * 로그인/크레딧 없이 누구나 호출 가능 (논문 검색 프록시와 동일한 성격의 "순수 조회" 기능).
- */
-app.get('/api/fetch-url-metadata', async (req, res) => {
-  const rawUrl = (req.query.url || '').toString().trim();
-  let target;
-  try {
-    target = new URL(rawUrl);
-  } catch (e) {
-    return res.status(400).json({ success: false, error: '올바른 URL 형식이 아닙니다.' });
-  }
-  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
-    return res.status(400).json({ success: false, error: 'http:// 또는 https:// 주소만 지원합니다.' });
-  }
-  if (looksLikePrivateHost(target.hostname)) {
-    return res.status(400).json({ success: false, error: '허용되지 않는 주소입니다.' });
-  }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-  try {
-    const pageRes = await fetch(target.toString(), {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: {
-        // 일부 사이트는 기본 서버 User-Agent(예: node-fetch) 요청을 차단하므로, 일반 브라우저처럼 보이게 함
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-    });
-    if (!pageRes.ok) {
-      return res.status(502).json({ success: false, error: `페이지를 불러오지 못했습니다 (HTTP ${pageRes.status}).` });
-    }
-    const contentType = pageRes.headers.get('content-type') || '';
-    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml')) {
-      return res.status(415).json({ success: false, error: '이 주소는 웹페이지(HTML)가 아니에요.' });
-    }
-    // 메타 태그는 보통 <head> 안, 즉 문서 앞부분에 있으므로 앞 300KB만 읽어도 충분 — 대용량 페이지의 불필요한 파싱을 막는다
-    const fullText = await pageRes.text();
-    const html = fullText.slice(0, 300000);
-
-    const ogTitle = extractMetaContent(html, 'og:title');
-    const citationTitle = extractMetaContent(html, 'citation_title');
-    const titleTagMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
-
-    const authorsFromCitation = extractMetaContentAll(html, 'citation_author').filter(Boolean);
-    const ogSiteName = extractMetaContent(html, 'og:site_name');
-    const metaAuthor = extractMetaContent(html, 'author');
-
-    const ogDescription = extractMetaContent(html, 'og:description');
-    const metaDescription = extractMetaContent(html, 'description');
-
-    const title = citationTitle || ogTitle || (titleTagMatch ? decodeHtmlEntities(titleTagMatch[1]) : null);
-    const authors = authorsFromCitation.length ? authorsFromCitation.join(', ') : (metaAuthor || ogSiteName || null);
-    const description = ogDescription || metaDescription || null;
-    const journal = extractMetaContent(html, 'citation_journal_title') || ogSiteName || null;
-    const year = (() => {
-      const d = extractMetaContent(html, 'citation_publication_date') || extractMetaContent(html, 'citation_date') || extractMetaContent(html, 'article:published_time');
-      const m = (d || '').match(/\d{4}/);
-      return m ? Number(m[0]) : null;
-    })();
-
-    if (!title) {
-      return res.status(422).json({ success: false, error: '이 페이지에서 제목 정보를 찾을 수 없어요.' });
-    }
-    return res.json({ success: true, data: { title, authors, description, journal, year, url: target.toString() } });
-  } catch (error) {
-    const timedOut = error && error.name === 'AbortError';
-    console.error('URL 메타데이터 추출 에러:', error);
-    return res.status(timedOut ? 504 : 500).json({ success: false, error: timedOut ? '페이지 응답이 너무 느려요.' : '웹페이지 정보를 불러오는 중 오류가 발생했습니다.' });
-  } finally {
-    clearTimeout(timeout);
   }
 });
 
@@ -274,8 +157,11 @@ ${libraryContext}
 `;
 
     // 3. Gemini 모델 호출
+    // 주의: 'gemini-2.5-flash'는 2026-10월부로 신규 사용자에게 404(모델 폐기)를 반환한다.
+    // Gemini API가 에러 메시지에서 직접 안내한 최신 모델명으로 교체함 — 모델이 다시 바뀌면
+    // Render 로그의 404 에러 메시지에 적힌 권장 모델명으로 다시 교체하면 된다.
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.8-flash',
       contents: prompt,
     });
 
@@ -378,6 +264,180 @@ app.post('/api/payments/webhook', async (req, res) => {
   } catch (error) {
     console.error('웹훅 처리 에러:', error.message);
     return res.status(500).json({ success: false });
+  }
+});
+
+/**
+ * ---------------------------------------------------------------------------
+ * 크롬 확장 프로그램 연동 — DBpia/RISS/Google Scholar 등에서 DOI/URL/제목을 보내면
+ * 서버가 논문 메타데이터를 조회해서 "가져오기 대기함(pending_imports)"에 저장해두는 방식입니다.
+ *
+ * 왜 곧바로 화면에 노드로 추가되지 않고 "대기함"을 거치나요?
+ * PaperPulse는 이 서버에 서재(library) 데이터를 저장하지 않습니다 — 서재는 각 사용자의
+ * 브라우저 localStorage에만 있습니다. 그래서 확장 프로그램이 서버로 보낸 요청은
+ * "지금 열려 있는 특정 탭"에 실시간으로 꽂아 넣을 방법이 없습니다(웹소켓/실시간 채널이 없음).
+ * 대신 이 서버는 요청을 큐에 쌓아두고, paperpulse.html이 로그인 상태로 열려 있을 때
+ * 주기적으로(약 25초마다) + 창이 다시 포커스될 때 이 큐를 확인해서 자동으로 서재에 반영합니다.
+ * → 실시간은 아니지만 "탭이 열려 있으면 몇십 초 안에 자동 반영"되는 실용적인 절충안입니다.
+ *   진짜 즉시 반영이 필요하면 나중에 Supabase Realtime(웹소켓)으로 업그레이드할 수 있습니다.
+ *
+ * DOI/URL 해석 범위:
+ * - doi가 오면: Semantic Scholar → 실패 시 CrossRef 순으로 조회 (국내 학술지도 DOI가 있으면 대부분 커버)
+ * - doi 없이 title만 오면: Semantic Scholar 제목 검색 결과 1건(최선 추정치, 부정확할 수 있음)
+ * - RISS/DBpia처럼 DOI가 없는 국내 자료의 '순수 URL만'으로는 정확한 메타데이터를 보장할 수 없습니다
+ *   (해당 사이트들은 Semantic Scholar/CrossRef에 URL로 색인되어 있지 않음) — 확장 프로그램 쪽에서
+ *   가능하면 페이지에서 DOI 또는 제목을 함께 추출해서 보내주는 걸 권장합니다.
+ * ---------------------------------------------------------------------------
+ */
+const EXTERNAL_IMPORT_FIELDS = 'title,year,authors,venue,citationCount,abstract,tldr,fieldsOfStudy,externalIds,openAccessPdf,url';
+
+function mapS2ToImportPayload(raw) {
+  const authorsList = (raw.authors || []).map((a) => a.name).filter(Boolean);
+  const authorsStr = authorsList.length ? (authorsList.slice(0, 4).join(', ') + (authorsList.length > 4 ? ' 외' : '')) : '저자 정보 없음';
+  const tags = (raw.fieldsOfStudy && raw.fieldsOfStudy.length) ? raw.fieldsOfStudy.slice(0, 4) : (raw.venue ? [raw.venue] : ['미분류']);
+  const abstract = raw.abstract || '';
+  return {
+    id: raw.paperId,
+    title: raw.title || '(제목 정보 없음)',
+    authors: authorsStr,
+    journal: raw.venue || '학술지 정보 없음',
+    year: raw.year || null,
+    citations: typeof raw.citationCount === 'number' ? raw.citationCount : 0,
+    tldr: (raw.tldr && raw.tldr.text) || (abstract ? (abstract.length > 220 ? abstract.slice(0, 220) + '...' : abstract) : '크롬 확장 프로그램으로 가져온 논문입니다.'),
+    abstract,
+    tags,
+    methods: '',
+    doi: raw.externalIds && raw.externalIds.DOI ? raw.externalIds.DOI : null,
+    pdfUrl: raw.openAccessPdf && raw.openAccessPdf.url ? raw.openAccessPdf.url : null,
+    sourceUrl: raw.url || null,
+    saved: true,
+    collection: null,
+  };
+}
+function mapCrossrefToImportPayload(item) {
+  const authorsList = (item.author || []).map((a) => [a.given, a.family].filter(Boolean).join(' ')).filter(Boolean);
+  const authorsStr = authorsList.length ? (authorsList.slice(0, 4).join(', ') + (authorsList.length > 4 ? ' 외' : '')) : '저자 정보 없음';
+  const title = Array.isArray(item.title) && item.title.length ? item.title[0] : '(제목 정보 없음)';
+  const journal = Array.isArray(item['container-title']) && item['container-title'].length ? item['container-title'][0] : '';
+  const year = (item['published-print']?.['date-parts']?.[0]?.[0]) || (item['published-online']?.['date-parts']?.[0]?.[0]) || (item.issued?.['date-parts']?.[0]?.[0]) || null;
+  return {
+    id: `crossref-${item.DOI}`,
+    title,
+    authors: authorsStr,
+    journal: journal || '학술지 정보 없음',
+    year,
+    citations: typeof item['is-referenced-by-count'] === 'number' ? item['is-referenced-by-count'] : 0,
+    tldr: '크롬 확장 프로그램으로 가져온 논문입니다. (DOI 등록 정보 기반)',
+    abstract: '',
+    tags: journal ? [journal] : ['미분류'],
+    methods: '',
+    doi: item.DOI || null,
+    pdfUrl: null,
+    sourceUrl: item.URL || (item.DOI ? `https://doi.org/${item.DOI}` : null),
+    saved: true,
+    collection: null,
+  };
+}
+
+async function resolveExternalPaper({ doi, url, title }) {
+  if (doi) {
+    try {
+      const s2Res = await fetch(`https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(doi)}?fields=${EXTERNAL_IMPORT_FIELDS}`);
+      if (s2Res.ok) return mapS2ToImportPayload(await s2Res.json());
+    } catch (e) { /* 다음 방법으로 폴백 */ }
+    try {
+      const crRes = await fetch(`https://api.crossref.org/works/${encodeURIComponent(doi)}`);
+      if (crRes.ok) {
+        const crData = await crRes.json();
+        if (crData.message) return mapCrossrefToImportPayload(crData.message);
+      }
+    } catch (e) { /* 아래에서 최종 실패 처리 */ }
+  }
+  if (title) {
+    try {
+      const s2Res = await fetch(`https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(title)}&limit=1&fields=${EXTERNAL_IMPORT_FIELDS}`);
+      if (s2Res.ok) {
+        const data = await s2Res.json();
+        if (data.data && data.data[0]) return mapS2ToImportPayload(data.data[0]);
+      }
+    } catch (e) { /* 실패 시 아래에서 처리 */ }
+  }
+  return null;
+}
+
+/**
+ * [POST] /api/papers/external-import
+ * 크롬 확장 프로그램이 호출. Authorization: Bearer <로그인한 사용자의 Supabase access token>
+ * body: { doi?: string, url?: string, title?: string }  — doi 또는 title 중 최소 하나 필요
+ */
+app.post('/api/papers/external-import', requireAuth, async (req, res) => {
+  try {
+    const { doi, url, title } = req.body || {};
+    if (!doi && !title) {
+      return res.status(400).json({ success: false, error: 'doi 또는 title 중 하나는 반드시 필요합니다. (URL만으로는 국내 학술 사이트 특성상 정확한 조회가 어려워요)' });
+    }
+    const payload = await resolveExternalPaper({ doi, url, title });
+    if (!payload) {
+      return res.status(404).json({ success: false, error: '해당 논문 정보를 찾지 못했습니다. DOI를 함께 보내면 훨씬 정확해요.' });
+    }
+    if (url && !payload.sourceUrl) payload.sourceUrl = url;
+
+    const { data, error } = await supabaseAdmin
+      .from('pending_imports')
+      .insert({ user_id: req.user.id, payload, source_url: url || null })
+      .select()
+      .single();
+    if (error) throw error;
+
+    return res.json({ success: true, message: 'PaperPulse 앱이 열려 있으면 잠시 후 서재에 자동으로 추가됩니다.', item: data });
+  } catch (error) {
+    console.error('외부 논문 가져오기 에러:', error.message);
+    return res.status(500).json({ success: false, error: '논문 정보를 가져오는 중 서버 오류가 발생했습니다.' });
+  }
+});
+
+/**
+ * [GET] /api/papers/pending-imports
+ * paperpulse.html이 로그인 상태에서 주기적으로 호출해서, 확장 프로그램이 쌓아둔
+ * 미처리 항목을 가져갑니다. 소비(ack) 전까지는 계속 다시 조회될 수 있습니다.
+ */
+app.get('/api/papers/pending-imports', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('pending_imports')
+      .select('id, payload, created_at')
+      .eq('user_id', req.user.id)
+      .eq('consumed', false)
+      .order('created_at', { ascending: true })
+      .limit(50);
+    if (error) throw error;
+    return res.json({ success: true, items: data || [] });
+  } catch (error) {
+    console.error('가져오기 대기함 조회 에러:', error.message);
+    return res.status(500).json({ success: false, error: '대기 중인 항목을 조회하지 못했습니다.' });
+  }
+});
+
+/**
+ * [POST] /api/papers/pending-imports/ack
+ * 프론트엔드가 위 목록을 실제로 서재에 반영한 뒤 호출 — 처리 완료 표시(consumed=true)를 남겨서
+ * 다음 조회 때 같은 항목이 중복으로 다시 추가되지 않게 합니다.
+ * body: { ids: string[] }
+ */
+app.post('/api/papers/pending-imports/ack', requireAuth, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    if (!ids.length) return res.json({ success: true });
+    const { error } = await supabaseAdmin
+      .from('pending_imports')
+      .update({ consumed: true })
+      .eq('user_id', req.user.id)
+      .in('id', ids);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('가져오기 대기함 처리완료 표시 에러:', error.message);
+    return res.status(500).json({ success: false, error: '처리 완료 표시에 실패했습니다.' });
   }
 });
 
